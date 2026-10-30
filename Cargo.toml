@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/usbip-proto", "crates/server", "crates/client", "crates/tray"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+usbip-proto = { path = "crates/usbip-proto" }

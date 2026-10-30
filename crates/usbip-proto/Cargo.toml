@@ -1,0 +1,8 @@
+[package]
+name = "usbip-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "USB/IP wire protocol (v1.1.1) message types and codecs"
+
+[dependencies]

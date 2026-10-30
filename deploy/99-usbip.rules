@@ -1,0 +1,3 @@
+# Lets members of the "plugdev" group open USB devices without root.
+# sudo cp deploy/99-usbip.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="usb", MODE="0660", GROUP="plugdev"

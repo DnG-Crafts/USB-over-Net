@@ -1,0 +1,18 @@
+# Install on the Raspberry Pi:
+#   sudo cp target/release/usbip-server /usr/local/bin/
+#   sudo cp deploy/usbip-server.service /etc/systemd/system/
+#   sudo systemctl enable --now usbip-server
+[Unit]
+Description=USB over Net server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Add one --allow VID:PID per device you want to share (strongly recommended).
+ExecStart=/usr/local/bin/usbip-server --listen 0.0.0.0:3240
+Restart=on-failure
+# Runs as root so libusb can claim devices and detach kernel drivers.
+# To run unprivileged instead, install deploy/99-usbip.rules and set User=usbip (plus SupplementaryGroups=plugdev).
+
+[Install]
+WantedBy=multi-user.target

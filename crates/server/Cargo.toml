@@ -1,0 +1,22 @@
+[package]
+name = "usbip-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Userspace USB/IP server for Raspberry Pi / Linux, built on libusb"
+
+[[bin]]
+name = "usbip-server"
+path = "src/main.rs"
+
+[dependencies]
+usbip-proto.workspace = true
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusb = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libusb1-sys = "0.7"
+libc = "0.2"
+mdns-sd = "0.21.6"

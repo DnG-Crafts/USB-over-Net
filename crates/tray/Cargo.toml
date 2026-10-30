@@ -1,0 +1,22 @@
+[package]
+name = "usbip-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows system-tray GUI for the USB/IP client"
+
+[[bin]]
+name = "usbip-tray"
+path = "src/main.rs"
+
+[dependencies]
+usbip-client = { path = "../client" }
+
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

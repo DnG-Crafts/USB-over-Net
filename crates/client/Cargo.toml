@@ -1,0 +1,19 @@
+[package]
+name = "usbip-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "USB/IP client library and test CLI"
+
+[lib]
+name = "usbip_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "usbip-client"
+path = "src/main.rs"
+
+[dependencies]
+if-addrs = "0.15.0"
+mdns-sd = "0.21.6"
+usbip-proto.workspace = true
