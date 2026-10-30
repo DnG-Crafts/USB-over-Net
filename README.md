@@ -9,6 +9,8 @@ separate driver installer to hunt down.
 
 Both programs are written in Rust and speak the standard [USB/IP](https://docs.kernel.org/usb/usbip_protocol.html) protocol.
 
+![The USB over Net window, showing a Raspberry Pi server with a USB flash drive and a webcam in use](docs/screenshot.png)
+
 ## Features
 
 - **Automatic discovery.** Servers on your network appear by themselves (mDNS plus a subnet scan), with their devices underneath.
