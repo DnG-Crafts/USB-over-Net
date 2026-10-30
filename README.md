@@ -38,7 +38,10 @@ No kernel code lives in this repository.
    ```sh
    git clone https://github.com/DnG-Crafts/USB-over-Net.git
    cd USB-over-Net
-   ./install.sh
+   sudo chmod 777 install.sh
+   sudo chmod 777 uninstall.sh
+   sudo bash ./install.sh
+   
    ```
 2. **On Windows:** build and run the tray app ([instructions](#build-the-tray-app-windows)).
 3. The Pi appears in the window with its devices listed. Double-click a device (or **Device > Use selected device**).
