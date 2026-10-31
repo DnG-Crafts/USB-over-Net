@@ -38,6 +38,7 @@ No kernel code lives in this repository.
 
 1. **On the Pi:** clone the repo and run the installer ([details](#install-the-server-raspberry-pi--linux)):
    ```sh
+   sudo apt install git
    git clone https://github.com/DnG-Crafts/USB-over-Net.git
    cd USB-over-Net
    sudo chmod 777 install.sh
