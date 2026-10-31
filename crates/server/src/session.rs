@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use usbip_proto::{
-    errno, read_command, CmdSubmit, Command, IsoPacketDescriptor, ProtoError, Reply, RetSubmit, RetUnlink,
+    errno, read_command, CmdSubmit, Command, IsoPacketDescriptor, ProtoError, Reply, RetSubmit, RetUnlink, DIR_OUT,
 };
 
 /// Result of a finished transfer. `data` is only meaningful for IN transfers.
@@ -63,8 +64,36 @@ pub trait UsbBackend: Send + Sync + 'static {
     fn iso_wait(&self, pending: Self::IsoPending, cancel: &AtomicBool) -> Result<IsoDone, i32>;
 }
 
+/// How long an unlinked bulk/interrupt OUT transfer that is already on the wire may keep running.
+///
+/// Cancelling it halfway would drop the rest of its bytes, and a client that gives up after a short
+/// timeout (the Windows driver for a CH340 serial adapter cancels a 2048-byte write after about 30 ms,
+/// while the adapter needs 44 ms at 460800 baud) would silently lose data. So such a transfer is left to
+/// finish; only one that is still not done after this long (a device that stopped listening) is cancelled.
+#[cfg(not(test))]
+const UNLINK_GRACE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const UNLINK_GRACE: Duration = Duration::from_millis(300);
+
 struct Urb {
     cancel: AtomicBool,
+    /// An OUT transfer on a non-control endpoint: unlinking it waits for `UNLINK_GRACE` once it has started.
+    hold_unlink: bool,
+    /// The worker has begun this transfer.
+    started: AtomicBool,
+    /// Sequence number of a `CMD_UNLINK` we have not answered yet because the transfer is still running.
+    pending_unlink: Mutex<Option<u32>>,
+}
+
+impl Urb {
+    fn new(cmd: &CmdSubmit) -> Arc<Self> {
+        Arc::new(Self {
+            cancel: AtomicBool::new(false),
+            hold_unlink: cmd.direction == DIR_OUT && cmd.ep != 0 && !cmd.is_iso(),
+            started: AtomicBool::new(false),
+            pending_unlink: Mutex::new(None),
+        })
+    }
 }
 
 struct Job {
@@ -101,7 +130,12 @@ where
             Err(e) => break Err(e),
 
             Ok(Some(Command::Submit(cmd))) => {
-                let urb = Arc::new(Urb { cancel: AtomicBool::new(false) });
+                tracing::debug!(
+                    "recv seq={} ep{} {} len={}{}",
+                    cmd.seqnum, cmd.ep, if cmd.is_in() { "IN" } else { "OUT" }, cmd.transfer_buffer_length,
+                    if cmd.is_iso() { " iso" } else { "" }
+                );
+                let urb = Urb::new(&cmd);
                 lock(&inflight).insert(cmd.seqnum, Arc::clone(&urb));
 
                 let key = endpoint_key(&cmd);
@@ -122,14 +156,48 @@ where
                 // Decide and reply under the in-flight lock so a worker cannot sneak a
                 // RET_SUBMIT out between the decision and the reply.
                 let mut map = lock(&inflight);
-                let status = match map.remove(&u.unlink_seqnum) {
-                    Some(urb) => {
-                        urb.cancel.store(true, Ordering::SeqCst);
-                        -errno::ECONNRESET
+                let target = map.get(&u.unlink_seqnum).cloned();
+                match target {
+                    None => {
+                        tracing::debug!("recv unlink of seq={}: already finished", u.unlink_seqnum);
+                        send(&writer, &Reply::Unlink(RetUnlink { seqnum: u.seqnum, status: 0 }).encode());
                     }
-                    None => 0, // already completed (or never existed)
-                };
-                send(&writer, &Reply::Unlink(RetUnlink { seqnum: u.seqnum, status }).encode());
+                    Some(urb) if urb.hold_unlink && urb.started.load(Ordering::SeqCst) => {
+                        tracing::debug!(
+                            "recv unlink of seq={}: OUT transfer is running, letting it finish (up to {} ms)",
+                            u.unlink_seqnum, UNLINK_GRACE.as_millis()
+                        );
+                        *lock(&urb.pending_unlink) = Some(u.seqnum);
+                        drop(map);
+                        let (w, i, target) = (Arc::clone(&writer), Arc::clone(&inflight), u.unlink_seqnum);
+                        thread::spawn(move || {
+                            let deadline = Instant::now() + UNLINK_GRACE;
+                            loop {
+                                thread::sleep(Duration::from_millis(5));
+                                let mut map = lock(&i);
+                                let Some(urb) = map.get(&target).cloned() else {
+                                    return; // it finished; the worker has answered both messages
+                                };
+                                if Instant::now() < deadline {
+                                    continue;
+                                }
+                                // Still not done: the device is not taking the data. Cancel it for real.
+                                map.remove(&target);
+                                urb.cancel.store(true, Ordering::SeqCst);
+                                if let Some(seq) = lock(&urb.pending_unlink).take() {
+                                    send(&w, &Reply::Unlink(RetUnlink { seqnum: seq, status: -errno::ECONNRESET }).encode());
+                                }
+                                return;
+                            }
+                        });
+                    }
+                    Some(urb) => {
+                        tracing::debug!("recv unlink of seq={}: still pending, cancelling", u.unlink_seqnum);
+                        map.remove(&u.unlink_seqnum);
+                        urb.cancel.store(true, Ordering::SeqCst);
+                        send(&writer, &Reply::Unlink(RetUnlink { seqnum: u.seqnum, status: -errno::ECONNRESET }).encode());
+                    }
+                }
             }
         }
     };
@@ -166,8 +234,12 @@ struct IsoJob<P> {
 /// Send the reply for a finished URB unless an unlink already answered for it.
 fn finish<W: Write>(inflight: &Inflight, writer: &Mutex<W>, seqnum: u32, reply: &RetSubmit) {
     let mut map = lock(inflight);
-    if map.remove(&seqnum).is_some() {
+    if let Some(urb) = map.remove(&seqnum) {
         send(writer, &reply.encode());
+        // An unlink we held back because this transfer was running: it was too late to cancel.
+        if let Some(seq) = lock(&urb.pending_unlink).take() {
+            send(writer, &Reply::Unlink(RetUnlink { seqnum: seq, status: 0 }).encode());
+        }
     } // else: unlinked while running; RET_UNLINK was already sent, so stay silent
 }
 
@@ -185,8 +257,11 @@ fn worker_loop<B: UsbBackend, W: Write + Send + 'static>(
         if job.urb.cancel.load(Ordering::SeqCst) {
             continue; // unlinked before it ever started; the unlink already replied
         }
+        job.urb.started.store(true, Ordering::SeqCst);
         if !job.cmd.is_iso() {
+            let started = Instant::now();
             let reply = execute(&*backend, &job.cmd, &job.urb.cancel);
+            tracing::debug!("seq={} took {} ms", job.cmd.seqnum, started.elapsed().as_millis());
             finish(&inflight, &writer, job.cmd.seqnum, &reply);
             continue;
         }
@@ -252,12 +327,19 @@ fn execute<B: UsbBackend>(b: &B, c: &CmdSubmit, cancel: &AtomicBool) -> RetSubmi
     if !c.is_iso() {
         rs.number_of_packets = c.number_of_packets;
     }
-    // Control traffic is the enumeration handshake: always log failures, and everything at debug.
-    if rs.status != 0 && c.ep == 0 {
-        tracing::warn!(
-            "control request failed: setup={:02x?} len={} -> status {}",
-            c.setup, c.transfer_buffer_length, rs.status
-        );
+    // Failures are always logged (except a cancel the client asked for); successes only at debug.
+    if rs.status != 0 && !(c.ep != 0 && rs.status == -errno::ECONNRESET) {
+        if c.ep == 0 {
+            tracing::warn!(
+                "control request failed: setup={:02x?} len={} -> status {}",
+                c.setup, c.transfer_buffer_length, rs.status
+            );
+        } else {
+            tracing::warn!(
+                "ep{} {} len={} failed -> status {} (errno {})",
+                c.ep, if is_in { "IN" } else { "OUT" }, c.transfer_buffer_length, rs.status, -rs.status
+            );
+        }
     } else {
         tracing::debug!(
             "ep{} {} len={} setup={:02x?} -> status {} actual {}",
@@ -315,7 +397,7 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use usbip_proto::{read_reply, CmdUnlink, IsoPacketDescriptor, DIR_IN, DIR_OUT, NON_ISO};
 
     const GET_DESCRIPTOR: [u8; 8] = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00];
@@ -359,6 +441,13 @@ mod tests {
                     d.truncate(in_len);
                     Ok(Completed { actual_length: d.len(), data: d })
                 }
+                0x04 => loop {
+                    // An OUT endpoint whose device never takes the data: blocks until cancelled.
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(errno::ECONNRESET);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                },
                 0x02 => {
                     if out == [1] {
                         thread::sleep(Duration::from_millis(40)); // would be overtaken if not ordered
@@ -551,6 +640,47 @@ mod tests {
         // If seq 1 had also been answered, its RET_SUBMIT would arrive before this one.
         h.submit(3, 0, DIR_IN, GET_DESCRIPTOR, vec![], 8);
         assert_eq!(submit_reply(h.reply()).seqnum, 3);
+        h.finish().unwrap();
+    }
+
+    #[test]
+    fn unlinking_a_running_out_transfer_lets_it_finish_instead_of_truncating_it() {
+        let mut h = start();
+        h.submit(1, 2, DIR_OUT, [0; 8], vec![1], 1); // the fake takes 40 ms to accept this
+        thread::sleep(Duration::from_millis(10)); // now it is running
+        h.unlink(2, 1);
+        let r = submit_reply(h.reply());
+        assert_eq!((r.seqnum, r.status, r.actual_length), (1, 0, 1));
+        assert_eq!(h.reply(), Reply::Unlink(RetUnlink { seqnum: 2, status: 0 }));
+        assert_eq!(h.fake.entries(), vec!["out [1]"]); // the data really went out
+        h.finish().unwrap();
+    }
+
+    #[test]
+    fn a_running_out_transfer_that_never_finishes_is_cancelled_after_the_grace_period() {
+        let mut h = start();
+        h.submit(1, 4, DIR_OUT, [0; 8], vec![9], 1); // blocks forever
+        thread::sleep(Duration::from_millis(10));
+        let t = Instant::now();
+        h.unlink(2, 1);
+        assert_eq!(h.reply(), Reply::Unlink(RetUnlink { seqnum: 2, status: -errno::ECONNRESET }));
+        assert!(t.elapsed() >= UNLINK_GRACE - Duration::from_millis(50), "{:?}", t.elapsed());
+
+        h.submit(3, 0, DIR_IN, GET_DESCRIPTOR, vec![], 8); // no RET_SUBMIT for seq 1 came first
+        assert_eq!(submit_reply(h.reply()).seqnum, 3);
+        h.finish().unwrap();
+    }
+
+    #[test]
+    fn unlinking_an_out_transfer_that_has_not_started_cancels_it_at_once() {
+        let mut h = start();
+        h.submit(1, 2, DIR_OUT, [0; 8], vec![1], 1); // running for 40 ms
+        h.submit(2, 2, DIR_OUT, [0; 8], vec![2], 1); // queued behind it
+        thread::sleep(Duration::from_millis(10));
+        h.unlink(3, 2);
+        assert_eq!(h.reply(), Reply::Unlink(RetUnlink { seqnum: 3, status: -errno::ECONNRESET }));
+        assert_eq!(submit_reply(h.reply()).seqnum, 1);
+        assert_eq!(h.fake.entries(), vec!["out [1]"]); // seq 2 never reached the device
         h.finish().unwrap();
     }
 

@@ -51,6 +51,7 @@ pub mod errno {
     pub const EPROTO: i32 = 71;
     pub const EIO: i32 = 5;
     pub const EBUSY: i32 = 16;
+    pub const ENOMEM: i32 = 12;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

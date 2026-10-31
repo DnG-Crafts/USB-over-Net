@@ -148,6 +148,7 @@ impl LibusbBackend {
             let rc = ffi::libusb_submit_transfer(transfer);
             if rc != 0 {
                 ffi::libusb_free_transfer(transfer);
+                tracing::warn!("libusb refused to start a {} byte transfer on {endpoint:#04x} (libusb error {rc})", buf.len());
                 return Err(libusb_errno(rc));
             }
 
@@ -157,7 +158,10 @@ impl LibusbBackend {
             ffi::libusb_free_transfer(transfer);
             match status {
                 LIBUSB_TRANSFER_COMPLETED => Ok(actual),
-                LIBUSB_TRANSFER_CANCELLED => Err(errno::ECONNRESET),
+                LIBUSB_TRANSFER_CANCELLED => {
+                    tracing::debug!("cancelled on {endpoint:#04x} after {actual} of {} bytes", buf.len());
+                    Err(errno::ECONNRESET)
+                }
                 LIBUSB_TRANSFER_STALL => Err(errno::EPIPE),
                 LIBUSB_TRANSFER_NO_DEVICE => Err(errno::ENODEV),
                 LIBUSB_TRANSFER_OVERFLOW => Err(errno::EOVERFLOW),
@@ -249,6 +253,7 @@ fn libusb_errno(rc: c_int) -> i32 {
         LIBUSB_ERROR_PIPE => errno::EPIPE,
         LIBUSB_ERROR_OVERFLOW => errno::EOVERFLOW,
         LIBUSB_ERROR_NOT_SUPPORTED => errno::ENOSYS,
+        LIBUSB_ERROR_NO_MEM => errno::ENOMEM,
         _ => errno::EIO,
     }
 }
